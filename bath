@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>温度計 OCR アラートシステム</title>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+    <style>
+        :root { --primary-color: #007bff; --danger-color: #dc3545; --success-color: #28a745; }
+        body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: white; margin: 0; display: flex; flex-direction: column; align-items: center; }
+        
+        #app-container { width: 100%; max-width: 480px; padding: 20px; box-sizing: border-box; }
+        
+        /* 映像表示エリア */
+        .video-wrapper { position: relative; width: 100%; border-radius: 15px; overflow: hidden; border: 2px solid #444; background: black; }
+        video { width: 100%; display: block; }
+        
+        /* 設定エリア */
+        .config-panel { background: #333; margin-top: 15px; padding: 15px; border-radius: 12px; display: flex; justify-content: space-around; align-items: center; }
+        input[type="number"] { width: 80px; font-size: 1.2rem; padding: 5px; border-radius: 5px; border: none; text-align: center; }
+        
+        /* 結果表示エリア */
+        .result-panel { margin-top: 15px; padding: 20px; border-radius: 12px; background: #222; text-align: center; transition: 0.3s; }
+        #current-val { font-size: 3.5rem; font-weight: bold; color: var(--primary-color); font-family: 'Courier New', monospace; }
+        
+        /* アラート状態のスタイル */
+        .alert-active { background-color: var(--danger-color) !important; animation: blink 0.6s infinite; }
+        @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+
+        button { width: 100%; padding: 15px; font-size: 1.1rem; font-weight: bold; border: none; border-radius: 12px; margin-top: 15px; cursor: pointer; transition: 0.3s; }
+        .btn-start { background: var(--success-color); color: white; }
+        .btn-stop { background: #666; color: white; }
+    </style>
+</head>
+<body>
+
+<div id="app-container">
+    <h2 style="text-align: center; margin: 10px 0;">温度モニター AI</h2>
+    
+    <div class="video-wrapper">
+        <video id="video" autoplay playsinline></video>
+    </div>
+
+    <div class="config-panel">
+        <div>
+            <span>通知温度: </span>
+            <input type="number" id="threshold" value="30.0" step="0.1"> ℃
+        </div>
+    </div>
+
+    <div class="result-panel" id="display-area">
+        <div style="font-size: 0.9rem; opacity: 0.8;">現在の認識数値</div>
+        <div id="current-val">--.-</div>
+        <div id="status-text" style="font-size: 0.8rem; margin-top: 5px;">停止中</div>
+    </div>
+
+    <button id="main-btn" class="btn-start">監視スタート</button>
+</div>
+
+<script>
+    const video = document.getElementById('video');
+    const mainBtn = document.getElementById('main-btn');
+    const currentValDisplay = document.getElementById('current-val');
+    const displayArea = document.getElementById('display-area');
+    const thresholdInput = document.getElementById('threshold');
+    const statusText = document.getElementById('status-text');
+
+    let isMonitoring = false;
+    let scanInterval = null;
+    let isSpeaking = false;
+
+    // --- 音声通知関数 ---
+    function speakAlert(temp) {
+        if (isSpeaking) return;
+        isSpeaking = true;
+        
+        const msg = new SpeechSynthesisUtterance();
+        msg.text = `警告。温度が${temp}度を超えました。`;
+        msg.lang = 'ja-JP';
+        msg.onend = () => {
+            // 連続発話を防ぐため、少し間隔をあける
+            setTimeout(() => { isSpeaking = false; }, 3000);
+        };
+        window.speechSynthesis.speak(msg);
+    }
+
+    // --- メイン処理 ---
+    mainBtn.onclick = async () => {
+        if (!isMonitoring) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+                    audio: false 
+                });
+                video.srcObject = stream;
+                
+                isMonitoring = true;
+                mainBtn.innerText = "監視を停止する";
+                mainBtn.className = "btn-stop";
+                statusText.innerText = "解析中...";
+
+                // 3秒に1回スキャン
+                scanInterval = setInterval(doOCR, 3000);
+                
+                // 初回起動時にダミーの音声を流す（ブラウザのロック解除用）
+                const startupMsg = new SpeechSynthesisUtterance("");
+                window.speechSynthesis.speak(startupMsg);
+
+            } catch (err) {
+                alert("カメラを起動できませんでした。HTTPS接続を確認してください。");
+            }
+        } else {
+            // 停止処理
+            clearInterval(scanInterval);
+            const stream = video.srcObject;
+            stream.getTracks().forEach(track => track.stop());
+            video.srcObject = null;
+            
+            isMonitoring = false;
+            mainBtn.innerText = "監視スタート";
+            mainBtn.className = "btn-start";
+            statusText.innerText = "停止中";
+            displayArea.classList.remove('alert-active');
+        }
+    };
+
+    // --- OCR実行 ---
+    async function doOCR() {
+        if (!isMonitoring) return;
+
+        // Tesseractの設定: 数字とドットのみを許可
+        const result = await Tesseract.recognize(video, 'eng', {
+            tessedit_char_whitelist: '0123456789.',
+            logger: m => { if(m.status === 'recognizing') statusText.innerText = `解析中...(${Math.round(m.progress * 100)}%)`; }
+        });
+
+        const rawText = result.data.text.replace(/[^0-9.]/g, '');
+        const num = parseFloat(rawText);
+        
+        if (!isNaN(num)) {
+            currentValDisplay.innerText = num.toFixed(1);
+            const limit = parseFloat(thresholdInput.value);
+
+            if (num >= limit) {
+                displayArea.classList.add('alert-active');
+                speakAlert(num.toFixed(1));
+                if (navigator.vibrate) navigator.vibrate([500, 200, 500]);
+            } else {
+                displayArea.classList.remove('alert-active');
+            }
+        } else {
+            statusText.innerText = "数値を読み取れません...";
+        }
+    }
+</script>
+
+</body>
+</html>
